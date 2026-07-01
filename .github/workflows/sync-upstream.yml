@@ -106,28 +106,19 @@ jobs:
           TARGET_SHA="${{ steps.resolve.outputs.target_sha }}"
           MODE="${{ steps.resolve.outputs.mode }}"
           git checkout main
-          if [ "$MODE" = "manual" ]; then
-            # Hard reset allows both upgrade and rollback
-            git reset --hard "$TARGET_SHA"
-          else
-            # Merge without committing, strip upstream workflow files to avoid
-            # triggering the "workflows" GitHub App permission requirement
-            git merge "$TARGET_SHA" --no-commit --no-edit
-            git reset HEAD -- .github/workflows/ .github/dependabot.yml 2>/dev/null || true
-            git checkout -- .github/workflows/ .github/dependabot.yml 2>/dev/null || true
-            git commit -m "chore: sync with upstream $TARGET_SHA"
-          fi
+          # Merge without committing, strip upstream workflow files
+          # to avoid triggering the "workflows" GitHub App permission requirement
+          git merge "$TARGET_SHA" --no-commit --no-edit
+          git reset HEAD -- .github/workflows/ .github/dependabot.yml 2>/dev/null || true
+          git checkout -- .github/workflows/ .github/dependabot.yml 2>/dev/null || true
+          git commit -m "chore: sync with upstream $TARGET_SHA"
 
       # Workflow files are already stripped in Apply update step above
 
       - name: Push
         if: steps.check.outputs.needs_update == 'true'
         run: |
-          if [ "${{ steps.resolve.outputs.mode }}" = "manual" ]; then
-            git push origin main --force
-          else
-            git push origin main
-          fi
+          git push origin main
 
       - name: Summary
         run: |
