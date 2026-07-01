@@ -106,6 +106,7 @@ jobs:
           TARGET_SHA="${{ steps.resolve.outputs.target_sha }}"
           MODE="${{ steps.resolve.outputs.mode }}"
           git checkout main
+
           # Backup our workflow files before merge
           mkdir -p /tmp/wf_backup
           cp .github/workflows/* /tmp/wf_backup/ 2>/dev/null || true
@@ -114,10 +115,13 @@ jobs:
           # Merge with -X theirs to avoid conflicts on workflow files
           git merge "$TARGET_SHA" --no-commit --no-edit -X theirs
 
-          # Restore our workflow files (strip upstream's)
+          # Completely wipe upstream workflow files and restore only ours
+          rm -rf .github/workflows/ .github/dependabot.yml
+          mkdir -p .github/workflows/
           cp /tmp/wf_backup/* .github/workflows/ 2>/dev/null || true
           cp /tmp/wf_backup/dependabot.yml .github/ 2>/dev/null || true
-          rm -f /tmp/wf_backup/*
+          rm -rf /tmp/wf_backup
+
           git add -A
           git commit -m "chore: sync with upstream $TARGET_SHA"
 
