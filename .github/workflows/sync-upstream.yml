@@ -12,7 +12,6 @@ on:
 
 permissions:
   contents: write
-  workflows: write
 
 jobs:
   sync:
@@ -114,13 +113,15 @@ jobs:
             git merge "$TARGET_SHA" --no-edit
           fi
 
-      - name: Restore workflow file
+      - name: Restore workflow files
         if: steps.check.outputs.needs_update == 'true'
         run: |
-          # Always keep our own workflow file, never let upstream overwrite it
-          git checkout HEAD@{1} -- .github/workflows/sync-upstream.yml 2>/dev/null || true
+          # Revert ALL workflow file changes from upstream merge
+          # This keeps the fork's own workflows and avoids triggering
+          # the "workflows" GitHub App permission requirement on push
+          git checkout HEAD@{1} -- .github/workflows/ 2>/dev/null || true
           if ! git diff --cached --quiet; then
-            git commit -m "chore: restore sync-upstream workflow after sync"
+            git commit -m "chore: restore fork workflow files after sync"
           fi
 
       - name: Push
