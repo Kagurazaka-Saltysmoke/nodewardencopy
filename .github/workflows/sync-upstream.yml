@@ -106,11 +106,19 @@ jobs:
           TARGET_SHA="${{ steps.resolve.outputs.target_sha }}"
           MODE="${{ steps.resolve.outputs.mode }}"
           git checkout main
-          # Merge without committing, strip upstream workflow files
-          # to avoid triggering the "workflows" GitHub App permission requirement
-          git merge "$TARGET_SHA" --no-commit --no-edit
-          git reset HEAD -- .github/workflows/ .github/dependabot.yml 2>/dev/null || true
-          git checkout -- .github/workflows/ .github/dependabot.yml 2>/dev/null || true
+          # Backup our workflow files before merge
+          mkdir -p /tmp/wf_backup
+          cp .github/workflows/* /tmp/wf_backup/ 2>/dev/null || true
+          cp .github/dependabot.yml /tmp/wf_backup/ 2>/dev/null || true
+
+          # Merge with -X theirs to avoid conflicts on workflow files
+          git merge "$TARGET_SHA" --no-commit --no-edit -X theirs
+
+          # Restore our workflow files (strip upstream's)
+          cp /tmp/wf_backup/* .github/workflows/ 2>/dev/null || true
+          cp /tmp/wf_backup/dependabot.yml .github/ 2>/dev/null || true
+          rm -f /tmp/wf_backup/*
+          git add -A
           git commit -m "chore: sync with upstream $TARGET_SHA"
 
       # Workflow files are already stripped in Apply update step above
