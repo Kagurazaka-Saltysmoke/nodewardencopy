@@ -110,19 +110,15 @@ jobs:
             # Hard reset allows both upgrade and rollback
             git reset --hard "$TARGET_SHA"
           else
-            git merge "$TARGET_SHA" --no-edit
+            # Merge without committing, strip upstream workflow files to avoid
+            # triggering the "workflows" GitHub App permission requirement
+            git merge "$TARGET_SHA" --no-commit --no-edit
+            git reset HEAD -- .github/workflows/ .github/dependabot.yml 2>/dev/null || true
+            git checkout -- .github/workflows/ .github/dependabot.yml 2>/dev/null || true
+            git commit -m "chore: sync with upstream $TARGET_SHA"
           fi
 
-      - name: Restore workflow files
-        if: steps.check.outputs.needs_update == 'true'
-        run: |
-          # Revert ALL workflow file changes from upstream merge
-          # This keeps the fork's own workflows and avoids triggering
-          # the "workflows" GitHub App permission requirement on push
-          git checkout HEAD@{1} -- .github/workflows/ 2>/dev/null || true
-          if ! git diff --cached --quiet; then
-            git commit -m "chore: restore fork workflow files after sync"
-          fi
+      # Workflow files are already stripped in Apply update step above
 
       - name: Push
         if: steps.check.outputs.needs_update == 'true'
