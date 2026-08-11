@@ -78,10 +78,10 @@ jobs:
         run: |
           TARGET_SHA="${{ steps.resolve.outputs.target_sha }}"
 
-          # Tree comparison: ignore whitelist paths, if remaining tree is identical → skip
+          # Tree comparison: ignore whitelist paths (.github + wrangler.toml),
+          # if remaining tree is identical → skip
           if git diff --quiet "$TARGET_SHA" HEAD -- . \
-            ':(exclude).github/workflows' \
-            ':(exclude).github/dependabot.yml' \
+            ':(exclude).github' \
             ':(exclude)wrangler.toml'; then
             echo "Already up to date with $TARGET_SHA — skipping."
             echo "needs_update=false" >> $GITHUB_OUTPUT
@@ -100,9 +100,12 @@ jobs:
           KEEP_DIR="/tmp/keep"
           mkdir -p "$KEEP_DIR"
 
-          # --- Whitelist definition ---
-          WHITELIST_DIRS=( ".github/workflows" )
-          WHITELIST_FILES=( ".github/dependabot.yml" "wrangler.toml" )
+          # --- Whitelist definition: .github 整目录 + wrangler.toml ---
+          # .github 完全保留本地版（含本 workflow 自身 + dependabot），
+          # 这样 commit 不含 workflow 文件变更，push 无需 workflows 权限，
+          # 也不会把上游的 workflow 漂移进来。
+          WHITELIST_DIRS=( ".github" )
+          WHITELIST_FILES=( "wrangler.toml" )
 
           # 1. Backup whitelist directories
           for dir in "${WHITELIST_DIRS[@]}"; do
@@ -127,8 +130,8 @@ jobs:
           # 2. Nuke all tracked files
           git rm -rq --ignore-unmatch .
 
-          # 3. Checkout upstream tree at TARGET_SHA
-          git checkout "$TARGET_SHA" -- .
+          # 3. Checkout upstream tree at TARGET_SHA (exclude .github entirely)
+          git checkout "$TARGET_SHA" -- . ':(exclude).github'
 
           # 4. Restore whitelist files from backup
           for dir in "${WHITELIST_DIRS[@]}"; do
