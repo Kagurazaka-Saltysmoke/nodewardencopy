@@ -77,55 +77,124 @@ jobs:
         id: check
         run: |
           TARGET_SHA="${{ steps.resolve.outputs.target_sha }}"
-          MODE="${{ steps.resolve.outputs.mode }}"
 
-          if [ "$MODE" = "manual" ]; then
-            # Manual: skip only if HEAD is exactly this commit
-            CURRENT_SHA=$(git rev-parse HEAD)
-            if [ "$CURRENT_SHA" = "$TARGET_SHA" ]; then
-              echo "Already at $TARGET_SHA — skipping."
-              echo "needs_update=false" >> $GITHUB_OUTPUT
-            else
-              echo "Switching to $TARGET_SHA"
-              echo "needs_update=true" >> $GITHUB_OUTPUT
-            fi
+          # Tree comparison: ignore whitelist paths, if remaining tree is identical → skip
+          if git diff --quiet "$TARGET_SHA" HEAD -- . \
+            ':(exclude).github/workflows' \
+            ':(exclude).github/dependabot.yml' \
+            ':(exclude)wrangler.toml'; then
+            echo "Already up to date with $TARGET_SHA — skipping."
+            echo "needs_update=false" >> $GITHUB_OUTPUT
           else
-            # Auto: skip if target is already in ancestry
-            if git merge-base --is-ancestor "$TARGET_SHA" HEAD 2>/dev/null; then
-              echo "Already up to date with $TARGET_SHA — skipping."
-              echo "needs_update=false" >> $GITHUB_OUTPUT
-            else
-              echo "Update needed — target: $TARGET_SHA"
-              echo "needs_update=true" >> $GITHUB_OUTPUT
-            fi
+            echo "Update needed — target: $TARGET_SHA"
+            echo "needs_update=true" >> $GITHUB_OUTPUT
           fi
 
       - name: Apply update
         if: steps.check.outputs.needs_update == 'true'
         run: |
+          set -euo pipefail
+
           TARGET_SHA="${{ steps.resolve.outputs.target_sha }}"
-          MODE="${{ steps.resolve.outputs.mode }}"
-          git checkout main
 
-          # Backup our workflow files before merge
-          mkdir -p /tmp/wf_backup
-          cp .github/workflows/* /tmp/wf_backup/ 2>/dev/null || true
-          cp .github/dependabot.yml /tmp/wf_backup/ 2>/dev/null || true
+          KEEP_DIR="/tmp/keep"
+          mkdir -p "$KEEP_DIR"
 
-          # Merge with -X theirs to avoid conflicts on workflow files
-          git merge "$TARGET_SHA" --no-commit --no-edit -X theirs
+          # --- Whitelist definition ---
+          WHITELIST_DIRS=( ".github/workflows" )
+          WHITELIST_FILES=( ".github/dependabot.yml" "wrangler.toml" )
 
-          # Completely wipe upstream workflow files and restore only ours
-          rm -rf .github/workflows/ .github/dependabot.yml
-          mkdir -p .github/workflows/
-          cp /tmp/wf_backup/* .github/workflows/ 2>/dev/null || true
-          cp /tmp/wf_backup/dependabot.yml .github/ 2>/dev/null || true
-          rm -rf /tmp/wf_backup
+          # 1. Backup whitelist directories
+          for dir in "${WHITELIST_DIRS[@]}"; do
+            if [ -d "$dir" ]; then
+              mkdir -p "$KEEP_DIR/$dir"
+              cp -r "$dir/." "$KEEP_DIR/$dir/"
+              echo "Backed up directory: $dir"
+            fi
+          done
 
+          # Backup whitelist files
+          for f in "${WHITELIST_FILES[@]}"; do
+            if [ -f "$f" ]; then
+              mkdir -p "$KEEP_DIR/$(dirname "$f")"
+              cp "$f" "$KEEP_DIR/$f"
+              echo "Backed up file: $f"
+            else
+              echo "::warning::Whitelist file not found, skipping backup: $f"
+            fi
+          done
+
+          # 2. Nuke all tracked files
+          git rm -rq --ignore-unmatch .
+
+          # 3. Checkout upstream tree at TARGET_SHA
+          git checkout "$TARGET_SHA" -- .
+
+          # 4. Restore whitelist files from backup
+          for dir in "${WHITELIST_DIRS[@]}"; do
+            if [ -d "$KEEP_DIR/$dir" ]; then
+              mkdir -p "$dir"
+              cp -r "$KEEP_DIR/$dir/." "$dir/"
+              echo "Restored directory: $dir"
+            fi
+          done
+
+          for f in "${WHITELIST_FILES[@]}"; do
+            if [ -f "$KEEP_DIR/$f" ]; then
+              mkdir -p "$(dirname "$f")"
+              cp "$KEEP_DIR/$f" "$f"
+              echo "Restored file: $f"
+            fi
+          done
+
+          # 5. Diff alert: compare upstream vs local for each whitelist entry
+          echo "### ⚠️ Whitelist Diff Report" >> $GITHUB_STEP_SUMMARY
+
+          HAS_DIFF=false
+
+          # Check files inside whitelist directories
+          for dir in "${WHITELIST_DIRS[@]}"; do
+            if [ -d "$KEEP_DIR/$dir" ]; then
+              for local_file in $(find "$KEEP_DIR/$dir" -type f); do
+                rel_path="${local_file#$KEEP_DIR/}"
+                upstream_content=$(git show "$TARGET_SHA:$rel_path" 2>/dev/null || true)
+                if [ -z "$upstream_content" ]; then
+                  echo "- ℹ️ \`$rel_path\` — 本地预期保留（上游不存在）" >> $GITHUB_STEP_SUMMARY
+                elif ! diff -q <(echo "$upstream_content") "$rel_path" > /dev/null 2>&1; then
+                  echo "- ⚠️ \`$rel_path\` — differs from upstream; review manually" >> $GITHUB_STEP_SUMMARY
+                  HAS_DIFF=true
+                fi
+              done
+            fi
+          done
+
+          # Check individual whitelist files
+          for f in "${WHITELIST_FILES[@]}"; do
+            if [ -f "$f" ]; then
+              upstream_content=$(git show "$TARGET_SHA:$f" 2>/dev/null || true)
+              if [ -z "$upstream_content" ]; then
+                echo "- ℹ️ \`$f\` — 本地预期保留（上游不存在）" >> $GITHUB_STEP_SUMMARY
+              elif ! diff -q <(echo "$upstream_content") "$f" > /dev/null 2>&1; then
+                echo "- ⚠️ \`$f\` — differs from upstream; review manually" >> $GITHUB_STEP_SUMMARY
+                HAS_DIFF=true
+              fi
+            fi
+          done
+
+          if [ "$HAS_DIFF" = false ]; then
+            echo "- ✅ All whitelist files match upstream — no action needed" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          # 6. Commit
           git add -A
-          git commit -m "chore: sync with upstream $TARGET_SHA"
+          # --allow-empty should not happen, but guard just in case
+          if git diff --cached --quiet; then
+            echo "No changes to commit after overlay — skipping."
+          else
+            git commit -m "chore: sync with upstream $TARGET_SHA"
+          fi
 
-      # Workflow files are already stripped in Apply update step above
+          rm -rf "$KEEP_DIR"
 
       - name: Push
         if: steps.check.outputs.needs_update == 'true'
