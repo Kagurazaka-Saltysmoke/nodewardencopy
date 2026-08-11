@@ -13,6 +13,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: sync-upstream-${{ github.repository }}
+  cancel-in-progress: false
+
 jobs:
   sync:
     runs-on: ubuntu-latest
@@ -29,7 +33,8 @@ jobs:
       - name: Add upstream
         run: |
           git remote add upstream https://github.com/shuaiplus/NodeWarden.git || true
-          git fetch upstream --tags
+          # Fetch branches to a dedicated ref namespace (avoid polluting refs/tags)
+          git fetch upstream '+refs/heads/*:refs/remotes/upstream/*'
 
       - name: Resolve target commit
         id: resolve
@@ -44,7 +49,15 @@ jobs:
               echo "No release found in upstream."
               exit 1
             fi
-            TARGET_SHA=$(git rev-list -n 1 "$LATEST_TAG" 2>/dev/null)
+            # Fetch just that tag into a dedicated namespace, then resolve its commit.
+            # This avoids the race where a release published between fetch and resolve
+            # is not present locally, and avoids clobbering local refs/tags.
+            git fetch upstream "+refs/tags/$LATEST_TAG:refs/tags/upstream-release/$LATEST_TAG" || true
+            TARGET_SHA=$(git rev-parse "refs/tags/upstream-release/$LATEST_TAG^{}" 2>/dev/null)
+            if [ -z "$TARGET_SHA" ]; then
+              # Fallback: resolve from the branch refs we already fetched
+              TARGET_SHA=$(git rev-parse "refs/remotes/upstream/main" 2>/dev/null || true)
+            fi
             if [ -z "$TARGET_SHA" ]; then
               echo "Tag '$LATEST_TAG' not found after fetch."
               exit 1
@@ -56,7 +69,7 @@ jobs:
 
           elif [ -n "$MANUAL_INPUT" ]; then
             # Manual mode: use provided commit hash or tag
-            TARGET_SHA=$(git rev-parse "$MANUAL_INPUT" 2>/dev/null)
+            TARGET_SHA=$(git rev-parse "$MANUAL_INPUT" 2>/dev/null || git rev-parse "refs/tags/$MANUAL_INPUT" 2>/dev/null || true)
             if [ -z "$TARGET_SHA" ]; then
               echo "Cannot resolve '$MANUAL_INPUT' to a commit."
               exit 1
@@ -67,7 +80,7 @@ jobs:
 
           else
             # Manual mode, blank input: use latest commit on upstream/main
-            TARGET_SHA=$(git rev-parse upstream/main)
+            TARGET_SHA=$(git rev-parse refs/remotes/upstream/main)
             echo "mode=manual" >> $GITHUB_OUTPUT
             echo "target_sha=$TARGET_SHA" >> $GITHUB_OUTPUT
             echo "Manual mode — latest commit: $TARGET_SHA"
@@ -130,8 +143,8 @@ jobs:
           # 2. Nuke all tracked files
           git rm -rq --ignore-unmatch .
 
-          # 3. Checkout upstream tree at TARGET_SHA (exclude .github entirely)
-          git checkout "$TARGET_SHA" -- . ':(exclude).github'
+          # 3. Checkout upstream tree at TARGET_SHA (exclude .github + whitelist files)
+          git checkout "$TARGET_SHA" -- . ':(exclude).github' ':(exclude)wrangler.toml'
 
           # 4. Restore whitelist files from backup
           for dir in "${WHITELIST_DIRS[@]}"; do
@@ -155,29 +168,42 @@ jobs:
 
           HAS_DIFF=false
 
+          # Report upstream changes in whitelist paths (added/removed/modified),
+          # then byte-compare each local whitelist file against upstream.
+          # Use git diff --name-status to cover upstream additions we don't have locally.
+          while IFS= read -r status_path; do
+            [ -n "$status_path" ] || continue
+            st="${status_path%%$'\t'*}"
+            rel_path="${status_path#*$'\t'}"
+            case "$st" in
+              A|M|D|T)
+                echo "- ⚠️ \`$rel_path\` — upstream ${st}: review manually" >> $GITHUB_STEP_SUMMARY
+                HAS_DIFF=true
+                ;;
+            esac
+          done < <(git diff --name-status "$TARGET_SHA" HEAD -- .github wrangler.toml)
+
           # Check files inside whitelist directories
           for dir in "${WHITELIST_DIRS[@]}"; do
             if [ -d "$KEEP_DIR/$dir" ]; then
-              for local_file in $(find "$KEEP_DIR/$dir" -type f); do
+              while IFS= read -r -d '' local_file; do
                 rel_path="${local_file#$KEEP_DIR/}"
-                upstream_content=$(git show "$TARGET_SHA:$rel_path" 2>/dev/null || true)
-                if [ -z "$upstream_content" ]; then
+                if ! git cat-file -e "$TARGET_SHA:$rel_path" 2>/dev/null; then
                   echo "- ℹ️ \`$rel_path\` — 本地预期保留（上游不存在）" >> $GITHUB_STEP_SUMMARY
-                elif ! diff -q <(echo "$upstream_content") "$rel_path" > /dev/null 2>&1; then
+                elif ! git show "$TARGET_SHA:$rel_path" | cmp -s - "$rel_path"; then
                   echo "- ⚠️ \`$rel_path\` — differs from upstream; review manually" >> $GITHUB_STEP_SUMMARY
                   HAS_DIFF=true
                 fi
-              done
+              done < <(find "$KEEP_DIR/$dir" -type f -print0)
             fi
           done
 
           # Check individual whitelist files
           for f in "${WHITELIST_FILES[@]}"; do
             if [ -f "$f" ]; then
-              upstream_content=$(git show "$TARGET_SHA:$f" 2>/dev/null || true)
-              if [ -z "$upstream_content" ]; then
+              if ! git cat-file -e "$TARGET_SHA:$f" 2>/dev/null; then
                 echo "- ℹ️ \`$f\` — 本地预期保留（上游不存在）" >> $GITHUB_STEP_SUMMARY
-              elif ! diff -q <(echo "$upstream_content") "$f" > /dev/null 2>&1; then
+              elif ! git show "$TARGET_SHA:$f" | cmp -s - "$f"; then
                 echo "- ⚠️ \`$f\` — differs from upstream; review manually" >> $GITHUB_STEP_SUMMARY
                 HAS_DIFF=true
               fi
